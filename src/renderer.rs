@@ -21,6 +21,7 @@ use crate::structure::*;
 use crate::texture::Texture;
 use crate::utils::*;
 
+mod culling;
 mod draw;
 mod motion;
 mod pipelines;
@@ -88,6 +89,7 @@ pub struct GSWTRenderer {
     authored_runtime_error: Option<String>,
 
     draw_resources: DrawResources,
+    early_culling: Option<culling::GroupCulling>,
     prepared_draws: Vec<PreparedDraw>,
     buffer_base_data: Vec<Vec<Vec<BufferDataValue>>>,
 
@@ -157,6 +159,12 @@ impl GSWTRenderer {
         let texture_width = preload_data.tile_splats_merged.tex_width as u32;
         let texture_height = preload_data.tile_splats_merged.tex_height as u32;
         let base_texels = preload_data.tile_splats_merged.tex_data.as_slice();
+        // Build once while canonical rows and the source basis are still available.
+        // Static archives and unsupported deformations retain the existing path.
+        let early_culling = preload_data
+            .merged_motion
+            .as_ref()
+            .map(|m| culling::GroupCulling::new(culling::motion_bounds(m)));
         let PreparedMotion {
             gaussian_texture,
             motion_runtime,
@@ -249,6 +257,7 @@ impl GSWTRenderer {
             authored_runtime_error: None,
 
             draw_resources,
+            early_culling,
             prepared_draws: Vec::new(),
             buffer_base_data,
 
@@ -265,6 +274,9 @@ impl GSWTRenderer {
     ) {
         self.user_data = user_data.clone();
         self.draw_resources.invalidate();
+        if let Some(culling) = self.early_culling.as_mut() {
+            culling.invalidate();
+        }
 
         let mut group_entries: Vec<wgpu::BindGroupEntry> = vec![
             wgpu::BindGroupEntry {
@@ -367,11 +379,41 @@ impl GSWTRenderer {
         let water_active = water_hits.is_some() && frame.active;
         let underwater_active = water_active && frame.underwater.is_some();
         let view_proj = camera.view_proj();
+        let culling_gains = self
+            .motion_runtime
+            .as_ref()
+            .filter(|runtime| runtime.motion_enabled())
+            .map(|runtime| runtime.global_controller_frame().gains)
+            .unwrap_or_default();
+        let early_culling_active = self.user_data.surface_type != SurfaceType::Sphere
+            && culling::supports_gains(culling_gains);
+        let early_visible = if early_culling_active {
+            self.early_culling.as_mut().map(|c| {
+                c.set_gains(culling_gains);
+                c.visibility(camera, &self.user_data, render_data)
+            })
+        } else {
+            None
+        };
+
         let visible_draws: Vec<bool> = sort_data
             .render_data_vec
             .iter()
             .enumerate()
             .map(|(i, (render_data_key, _))| {
+                // Preview/overlay do not move geometry. Only authored draws
+                // need the conservative fallback, including stale membership
+                // while an edit/erase is still being processed by the worker.
+                let authored = sort_data
+                    .authored
+                    .authored_draws
+                    .get(i)
+                    .copied()
+                    .unwrap_or(true);
+                if !authored && early_visible.as_ref().is_some_and(|v| !v[i]) {
+                    return false;
+                }
+
                 let tile_instance = &sort_data.tile_instance_vec[i];
                 let mut culled = false;
                 // A curved patch can enter the frustum while all four corners

@@ -256,3 +256,12 @@ acceptance; it does not establish actual sun-asset seam quality or frame rate.
   Off and one style-assignment stroke. Record FPS, CPU/GPU authored/GS p95,
   candidate/painted rows and affected draws. The 30 FPS desktop target remains
   unverified until browser measurements are recorded.
+
+## Animated group culling
+
+Whole-group rejection caches conservative animated-center bounds, including
+Catmull–Rom overshoot and canonical fallback. Effective nonnegative per-axis
+gains support amplified motion without rescanning Gaussian rows. Sphere mapping,
+unsupported gains and authored draws keep their existing fallback. Brush preview
+and overlays do not disable culling of unpainted groups. Camera movement reuses
+mapped bounds; configuration invalidates them.
