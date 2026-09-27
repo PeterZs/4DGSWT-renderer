@@ -273,6 +273,18 @@ pub(crate) struct WaterFrame {
 }
 
 impl WaterFrame {
+    /// Depth-free GS compositing is only eligible below the entire wave slab.
+    /// The caller must also exclude proxy depth. Base and authored pipelines
+    /// share this eligibility; brush preview and overlays do not change it.
+    pub(crate) fn allows_no_depth(&self, settings: &WaterSettings, eye_z: f32) -> bool {
+        self.active
+            && self.underwater.is_some()
+            && eye_z.is_finite()
+            && settings.height.is_finite()
+            && settings.amplitude.is_finite()
+            && eye_z < settings.height - settings.amplitude.abs() - 0.001
+    }
+
     pub(crate) fn new(camera: &Camera, user: &UserData, data: &RenderData) -> Self {
         let settings = &data.render_config.water;
         let bounds = settings

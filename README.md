@@ -13,7 +13,7 @@ local extensions are described below.
 ## Quick start
 
 Use a WebGPU-capable browser and the pinned Rust toolchain. Install wasm-pack 0.13.1
-and put Binaryen 132 on PATH; see [build requirements](docs/DEVELOPMENT.md#build).
+and put Binaryen 132 on PATH; see [build requirements](docs/DEVELOPMENT.md#build-and-validate).
 
 From this directory:
 
@@ -40,7 +40,6 @@ Upstream example assets:
 - [Usage](docs/USAGE.md): motion, painting, sessions, water and diagnostics.
 - [Development](docs/DEVELOPMENT.md): builds, asset contracts, runtime invariants,
   tests and known issues.
-- [Water performance](docs/water-performance.md): benchmark conditions and results.
 
 ## Credits
 

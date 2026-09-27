@@ -245,7 +245,7 @@ impl GSWTRenderer {
                 .unwrap_or(&self.empty_authored_base_rows_buffer);
             let bind_group = create_motion_field_bind_group(
                 device,
-                &self.motion_field_bind_group_layout,
+                &self.pipelines.motion_field_bind_group_layout,
                 &field,
                 stable_gaussian_view,
                 authored_gaussian_view,
@@ -290,7 +290,7 @@ impl GSWTRenderer {
             .unwrap_or(&self.gaussian_texture.view);
         let bind_group = create_motion_field_bind_group(
             device,
-            &self.motion_field_bind_group_layout,
+            &self.pipelines.motion_field_bind_group_layout,
             &field,
             stable_gaussian_view,
             stable_gaussian_view,
@@ -380,7 +380,7 @@ impl GSWTRenderer {
         if bindings_changed {
             self.motion_field_bind_group = Some(create_motion_field_bind_group(
                 device,
-                &self.motion_field_bind_group_layout,
+                &self.pipelines.motion_field_bind_group_layout,
                 field,
                 &motion.base_texture().view,
                 controller.output_view(),

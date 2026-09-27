@@ -25,6 +25,7 @@ mod culling;
 mod draw;
 mod motion;
 mod pipelines;
+mod shaders;
 use draw::{DrawComposition, DrawResources, DrawSource, PreparedDraw, TILE_STRIDE};
 use motion::{
     AuthoredDispatchKey, AuthoredRegistryKey, PreparedMotion, active_members,
@@ -32,9 +33,7 @@ use motion::{
 };
 #[cfg(test)]
 use motion::{build_motion_graph_outcome, map_coord_and_offset};
-use pipelines::PipelineSet;
-#[cfg(test)]
-use pipelines::{gs_shader_source, strip_motion_field_shader_blocks};
+use pipelines::{GaussianPass, PipelineSet};
 const INSTANCE_BUFFER_GROWTH_BYTES: u64 = 4 * 1024 * 1024;
 
 #[cfg(test)]
@@ -59,13 +58,7 @@ fn instance_buffer_capacity(current: u64, required: u64, limit: u64) -> Option<u
 }
 
 pub struct GSWTRenderer {
-    render_pipeline: wgpu::RenderPipeline,
-    motion_field_render_pipeline: wgpu::RenderPipeline,
-    water_render_pipeline: wgpu::RenderPipeline,
-    water_motion_field_render_pipeline: wgpu::RenderPipeline,
-    underwater_render_pipeline: wgpu::RenderPipeline,
-    underwater_motion_field_render_pipeline: wgpu::RenderPipeline,
-    empty_water_base_group: wgpu::BindGroup,
+    pipelines: PipelineSet,
     vertex_buffer: wgpu::Buffer,
 
     camera_uniforms_buffer: wgpu::Buffer,
@@ -76,9 +69,7 @@ pub struct GSWTRenderer {
     motion_field: Option<GpuMotionField>,
     motion_graph: Option<Arc<MotionGraph>>,
     motion_graph_error: Option<String>,
-    scene_bind_group_layout: wgpu::BindGroupLayout,
     scene_bind_group: Option<wgpu::BindGroup>,
-    motion_field_bind_group_layout: wgpu::BindGroupLayout,
     motion_field_bind_group: Option<wgpu::BindGroup>,
     empty_authored_base_rows_buffer: wgpu::Buffer,
     motion_field_render_active: bool,
@@ -102,18 +93,7 @@ impl GSWTRenderer {
         config: &wgpu::SurfaceConfiguration,
         preload_data: PreloadData,
     ) -> Result<Self, String> {
-        let PipelineSet {
-            render_pipeline,
-            motion_field_render_pipeline,
-            water_render_pipeline,
-            water_motion_field_render_pipeline,
-            underwater_render_pipeline,
-            underwater_motion_field_render_pipeline,
-            empty_water_base_group,
-            scene_bind_group_layout,
-            tile_bind_group_layout,
-            motion_field_bind_group_layout,
-        } = PipelineSet::new(device, config.format);
+        let pipelines = PipelineSet::new(device, config.format);
 
         // Vertex buffer
         let vertices = &mut [
@@ -178,7 +158,7 @@ impl GSWTRenderer {
             texture_width,
             texture_height,
         )?;
-        let draw_resources = DrawResources::new(device, &tile_bind_group_layout);
+        let draw_resources = DrawResources::new(device, &pipelines.tile_bind_group_layout);
 
         // Preloaded instance buffers
         let mut buffer_base_data = Vec::with_capacity(preload_data.tile_base_data.len());
@@ -227,13 +207,7 @@ impl GSWTRenderer {
             });
 
         Ok(Self {
-            render_pipeline,
-            motion_field_render_pipeline,
-            empty_water_base_group,
-            water_render_pipeline,
-            water_motion_field_render_pipeline,
-            underwater_render_pipeline,
-            underwater_motion_field_render_pipeline,
+            pipelines,
             vertex_buffer,
 
             camera_uniforms_buffer,
@@ -244,9 +218,7 @@ impl GSWTRenderer {
             motion_field: None,
             motion_graph,
             motion_graph_error,
-            scene_bind_group_layout,
             scene_bind_group: None,
-            motion_field_bind_group_layout,
             motion_field_bind_group: None,
             empty_authored_base_rows_buffer,
             motion_field_render_active: false,
@@ -317,7 +289,7 @@ impl GSWTRenderer {
         });
 
         let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.scene_bind_group_layout,
+            layout: &self.pipelines.scene_bind_group_layout,
             entries: &group_entries,
             label: Some("scene_bind_group"),
         });
@@ -378,6 +350,9 @@ impl GSWTRenderer {
         let profiling = render_data.profiler_enabled;
         let water_active = water_hits.is_some() && frame.active;
         let underwater_active = water_active && frame.underwater.is_some();
+        let water_fast = underwater_active
+            && !render_data.use_proxy
+            && frame.allows_no_depth(&render_config.water, camera.position().z);
         let view_proj = camera.view_proj();
         let culling_gains = self
             .motion_runtime
@@ -395,7 +370,6 @@ impl GSWTRenderer {
         } else {
             None
         };
-
         let visible_draws: Vec<bool> = sort_data
             .render_data_vec
             .iter()
@@ -413,7 +387,6 @@ impl GSWTRenderer {
                 if !authored && early_visible.as_ref().is_some_and(|v| !v[i]) {
                     return false;
                 }
-
                 let tile_instance = &sort_data.tile_instance_vec[i];
                 let mut culled = false;
                 // A curved patch can enter the frustum while all four corners
@@ -595,16 +568,20 @@ impl GSWTRenderer {
         });
 
         let mut using_motion_pipeline = false;
-        render_pass.set_pipeline(if underwater_active {
-            &self.underwater_render_pipeline
+        let pass = if water_fast {
+            GaussianPass::UnderwaterFast
+        } else if underwater_active {
+            GaussianPass::Underwater
         } else if water_active {
-            &self.water_render_pipeline
+            GaussianPass::Water
         } else {
-            &self.render_pipeline
-        });
+            GaussianPass::Dry
+        };
+        let (base_pipeline, motion_pipeline) = self.pipelines.for_pass(pass);
+        render_pass.set_pipeline(base_pipeline);
         render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
         if water_active {
-            render_pass.set_bind_group(2, &self.empty_water_base_group, &[]);
+            render_pass.set_bind_group(2, &self.pipelines.empty_water_base_group, &[]);
             render_pass.set_bind_group(3, water_hits.unwrap(), &[]);
         }
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
@@ -613,17 +590,11 @@ impl GSWTRenderer {
             let tid = tile_instance.tid;
             if draw.motion != using_motion_pipeline {
                 using_motion_pipeline = draw.motion;
-                render_pass.set_pipeline(
-                    match (using_motion_pipeline, water_active, underwater_active) {
-                        (true, true, true) => &self.underwater_motion_field_render_pipeline,
-                        (false, true, true) => &self.underwater_render_pipeline,
-                        (true, true, false) => &self.water_motion_field_render_pipeline,
-                        (true, false, false) => &self.motion_field_render_pipeline,
-                        (false, true, false) => &self.water_render_pipeline,
-                        (false, false, false) => &self.render_pipeline,
-                        (_, false, true) => unreachable!("underwater requires water"),
-                    },
-                );
+                render_pass.set_pipeline(if using_motion_pipeline {
+                    motion_pipeline
+                } else {
+                    base_pipeline
+                });
                 render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
                 if using_motion_pipeline {
                     render_pass.set_bind_group(
@@ -634,7 +605,7 @@ impl GSWTRenderer {
                         &[],
                     );
                 } else if water_active {
-                    render_pass.set_bind_group(2, &self.empty_water_base_group, &[]);
+                    render_pass.set_bind_group(2, &self.pipelines.empty_water_base_group, &[]);
                 }
                 if water_active {
                     render_pass.set_bind_group(3, water_hits.unwrap(), &[]);
@@ -1163,87 +1134,5 @@ mod tests {
 
         assert_eq!(coord, [48, 48]);
         assert_eq!(offset, [40.0, -20.0, 0.0]);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn base_and_motion_field_shaders_pass_native_wgsl_validation() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })) {
-                Ok(adapter) => adapter,
-                Err(error) => {
-                    eprintln!("motion field shader test skipped: no native adapter ({error})");
-                    return;
-                }
-            };
-        let (device, _) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("motion field shader validation device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
-        }))
-        .unwrap();
-        let authored = gs_shader_source(true, false);
-        let base = strip_motion_field_shader_blocks(&authored);
-        assert!(!base.contains("@group(2)"));
-        assert!(!base.contains("u_motion_field"));
-        for (label, source) in [
-            ("base shader", base.as_str()),
-            ("motion field shader", authored.as_str()),
-        ] {
-            device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let _shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            });
-            let error = pollster::block_on(device.pop_error_scope());
-            assert!(error.is_none(), "{label} WGSL validation failed: {error:?}");
-        }
-    }
-    #[test]
-    fn dry_gs_shader_has_no_water_depth_or_intersection_work() {
-        let source = strip_motion_field_shader_blocks(&gs_shader_source(false, false));
-        assert!(
-            !source.contains("@builtin(frag_depth)"),
-            "disabled water must use a color-only fragment shader"
-        );
-        assert!(
-            !source.contains("water_surface_hit("),
-            "disabled water cannot carry the iterative solver"
-        );
-        assert!(
-            !source.contains("water_moments"),
-            "disabled water cannot evaluate water cut moments"
-        );
-    }
-    #[test]
-    fn water_gs_shader_reads_shared_hits_without_solver() {
-        let source = gs_shader_source(true, false);
-        assert!(
-            !source.contains("fn water_surface_hit("),
-            "GS must not compile the iterative water solver"
-        );
-        assert!(
-            source.contains("load_water_hit("),
-            "GS must consume the current frame's shared hit texture"
-        );
-    }
-
-    #[test]
-    fn underwater_shader_is_a_separate_water_only_variant() {
-        let dry = gs_shader_source(false, false);
-        let wet = gs_shader_source(true, false);
-        let underwater = gs_shader_source(true, true);
-        assert!(!dry.contains("underwater_transmission"));
-        assert!(!wet.contains("underwater_transmission"));
-        assert!(underwater.contains("underwater_transmission"));
-        assert!(underwater.contains("load_water_hit("));
     }
 }

@@ -7,6 +7,9 @@ struct VertexOutput {
     @location(1) v_position: vec2<f32>,
     // WATER_BEGIN:varying
     @location(2) water_moments: vec2<f32>,
+    // FAST_CUT_BEGIN:varying
+    @location(3) @interpolate(flat) needs_water_cut: u32,
+    // FAST_CUT_END:varying
     // WATER_END:varying
 }
 
@@ -540,8 +543,27 @@ fn vs_main(
     out.v_color = vColor;
     out.v_position = position;
     // WATER_BEGIN:vertex
+    // FAST_CUT_BEGIN:bounds
+    // Bound world-ray Z over the entire quad, including a pixel guard.
+    // Wave weights sum to one: every animated surface lies in the height slab.
+    let probe_ndc = pos2d.xy / pos2d.w;
+    let probe_extent = (2.0 * abs(u_scene.splat_scale) * (abs(majorAxis) + abs(minorAxis)) + vec2(2.0)) / u_camera.viewport;
+    let probe_coeff = vec2(u_camera.view[2].x / u_camera.projection[0][0], u_camera.view[2].y / u_camera.projection[1][1]);
+    let probe_middle = dot(probe_coeff, probe_ndc) - u_camera.view[2].z;
+    let probe_radius = dot(abs(probe_coeff), probe_extent);
+    let probe_low = u_scene.water_level.x - abs(u_scene.water_waves.x) - 0.001;
+    let probe_high = u_scene.water_level.x + abs(u_scene.water_waves.x) + 0.001;
+    let probe_miss = (u_camera.cam_pos.z < probe_low && probe_middle + probe_radius < -0.00001)
+        || (u_camera.cam_pos.z > probe_high && probe_middle - probe_radius > 0.00001);
+    out.needs_water_cut = select(1u, 0u, probe_miss);
+    // FAST_CUT_END:bounds
     out.water_moments = vec2(center.z, 0.0);
+    // FULL_CUT_BEGIN:vertex
     if u_scene.water_level.y > 0.5 {
+    // FULL_CUT_END:vertex
+    // FAST_CUT_BEGIN:vertex
+    if u_scene.water_level.y > 0.5 && !probe_miss {
+    // FAST_CUT_END:vertex
         // Conditional world-Z distribution given the projected pixel. Packed
         // covariance is 4*Sigma (scene.rs); recover sigma with the factor 0.5.
         // This linearized Gaussian cut avoids whole-splat popping at the plane.
@@ -597,17 +619,31 @@ fn water_normal_cdf(x: f32) -> f32 {
     let erf = 1.0 - polynomial * exp(-a * a);
     return clamp(0.5 + 0.5 * sign(x) * erf, 0.0, 1.0);
 }
+// WATER_DEPTH_BEGIN:output
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @builtin(frag_depth) depth: f32,
 }
+// WATER_DEPTH_END:output
 @fragment
+// WATER_DEPTH_BEGIN:signature
 fn fs_main(in: VertexOutput) -> FragmentOutput {
+// WATER_DEPTH_END:signature
+// WATER_COLOR_BEGIN:signature
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+// WATER_COLOR_END:signature
     let A = -dot(in.v_position, in.v_position);
     if A < -4.0 { discard; }
     var B = exp(A) * in.v_color.a;
+    // WATER_DEPTH_BEGIN:initial
     var depth = in.clip_position.z;
+    // WATER_DEPTH_END:initial
+    // FULL_CUT_BEGIN:fragment
     if u_scene.water_level.y > 0.5 {
+    // FULL_CUT_END:fragment
+    // FAST_CUT_BEGIN:fragment
+    if u_scene.water_level.y > 0.5 && in.needs_water_cut != 0u {
+    // FAST_CUT_END:fragment
         let water_hit = load_water_hit(in.clip_position.xy);
         if water_hit.y > 0.5 {
             let side = select(-1.0, 1.0, u_camera.cam_pos.z >= u_scene.water_level.x);
@@ -617,14 +653,21 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
             if B < 1e-5 { discard; }
             // Both passes read the same full-precision cached depth. Equality
             // needs no bias, preserving occlusion by terrain in front of water.
+            // WATER_DEPTH_BEGIN:clamp
             depth = min(depth, water_hit.x);
+            // WATER_DEPTH_END:clamp
         }
     }
 
+    // WATER_DEPTH_BEGIN:return
     var out: FragmentOutput;
     out.color = vec4(B * in.v_color.rgb, B);
     out.depth = depth;
     return out;
+    // WATER_DEPTH_END:return
+    // WATER_COLOR_BEGIN:return
+    return vec4(B * in.v_color.rgb, B);
+    // WATER_COLOR_END:return
 }
 
 

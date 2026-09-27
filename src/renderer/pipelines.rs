@@ -1,5 +1,15 @@
 //! Shader variants, bind-group layouts, and Gaussian render pipeline construction.
+use super::shaders::{GsShader, gs_shader_source, strip_motion_field_shader_blocks};
 use crate::{structure::Vertex2D, texture::Texture};
+
+/// One selection per frame, before encoding individual draws.
+#[derive(Clone, Copy)]
+pub(super) enum GaussianPass {
+    Dry,
+    Water,
+    Underwater,
+    UnderwaterFast,
+}
 
 pub(super) struct PipelineSet {
     pub(super) render_pipeline: wgpu::RenderPipeline,
@@ -7,6 +17,8 @@ pub(super) struct PipelineSet {
     pub(super) water_render_pipeline: wgpu::RenderPipeline,
     pub(super) water_motion_field_render_pipeline: wgpu::RenderPipeline,
     pub(super) underwater_render_pipeline: wgpu::RenderPipeline,
+    pub(super) underwater_fast_render_pipeline: wgpu::RenderPipeline,
+    pub(super) underwater_fast_motion_field_render_pipeline: wgpu::RenderPipeline,
     pub(super) underwater_motion_field_render_pipeline: wgpu::RenderPipeline,
     pub(super) empty_water_base_group: wgpu::BindGroup,
     pub(super) scene_bind_group_layout: wgpu::BindGroupLayout,
@@ -15,6 +27,27 @@ pub(super) struct PipelineSet {
 }
 
 impl PipelineSet {
+    pub(super) fn for_pass(
+        &self,
+        pass: GaussianPass,
+    ) -> (&wgpu::RenderPipeline, &wgpu::RenderPipeline) {
+        match pass {
+            GaussianPass::Dry => (&self.render_pipeline, &self.motion_field_render_pipeline),
+            GaussianPass::Water => (
+                &self.water_render_pipeline,
+                &self.water_motion_field_render_pipeline,
+            ),
+            GaussianPass::Underwater => (
+                &self.underwater_render_pipeline,
+                &self.underwater_motion_field_render_pipeline,
+            ),
+            GaussianPass::UnderwaterFast => (
+                &self.underwater_fast_render_pipeline,
+                &self.underwater_fast_motion_field_render_pipeline,
+            ),
+        }
+    }
+
     pub(super) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let scene_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -152,7 +185,7 @@ impl PipelineSet {
                 ],
             });
 
-        let motion_field_shader_source = gs_shader_source(false, false);
+        let motion_field_shader_source = gs_shader_source(GsShader::Dry);
         let base_shader_source = strip_motion_field_shader_blocks(&motion_field_shader_source);
         let base_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Base GSWT shader"),
@@ -163,7 +196,7 @@ impl PipelineSet {
             source: wgpu::ShaderSource::Wgsl(motion_field_shader_source.into()),
         });
 
-        let wet_source = gs_shader_source(true, false);
+        let wet_source = gs_shader_source(GsShader::Water);
         let wet_base = strip_motion_field_shader_blocks(&wet_source);
         let wet_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Water-clipped GS shader"),
@@ -173,7 +206,7 @@ impl PipelineSet {
             label: Some("Water-clipped authored shader"),
             source: wgpu::ShaderSource::Wgsl(wet_source.into()),
         });
-        let underwater_source = gs_shader_source(true, true);
+        let underwater_source = gs_shader_source(GsShader::Underwater);
         let underwater_base = strip_motion_field_shader_blocks(&underwater_source);
         let underwater_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Underwater GS shader"),
@@ -283,12 +316,65 @@ impl PipelineSet {
             wgpu::CompareFunction::LessEqual,
         );
 
+        // Keep the vertex module independent of the color-only fragment entry,
+        // matching the validated no-depth + conservative-cut experiment.
+        let fast_vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Underwater fast vertex shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                strip_motion_field_shader_blocks(&gs_shader_source(GsShader::UnderwaterFastVertex))
+                    .into(),
+            ),
+        });
+        let fast_fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Underwater color-only fragment shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                strip_motion_field_shader_blocks(&gs_shader_source(
+                    GsShader::UnderwaterFastFragment,
+                ))
+                .into(),
+            ),
+        });
+        let underwater_fast_render_pipeline = create_render_pipeline_modules(
+            device,
+            format,
+            &water_base_layout,
+            &fast_vertex,
+            &fast_fragment,
+            "Underwater no-proxy fast pipeline",
+            wgpu::CompareFunction::Always,
+        );
+
+        // Same no-depth/cut optimization, retaining authored positions,
+        // brush preview and diagnostic overlay blocks in the vertex shader.
+        let authored_fast_vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Underwater authored fast vertex shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                gs_shader_source(GsShader::UnderwaterFastVertex).into(),
+            ),
+        });
+        let authored_fast_fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Underwater authored color-only fragment shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                gs_shader_source(GsShader::UnderwaterFastFragment).into(),
+            ),
+        });
+        let underwater_fast_motion_field_render_pipeline = create_render_pipeline_modules(
+            device,
+            format,
+            &water_authored_layout,
+            &authored_fast_vertex,
+            &authored_fast_fragment,
+            "Underwater authored no-proxy fast pipeline",
+            wgpu::CompareFunction::Always,
+        );
         Self {
             render_pipeline,
             motion_field_render_pipeline,
             water_render_pipeline,
             water_motion_field_render_pipeline,
             underwater_render_pipeline,
+            underwater_fast_render_pipeline,
+            underwater_fast_motion_field_render_pipeline,
             underwater_motion_field_render_pipeline,
             empty_water_base_group,
             scene_bind_group_layout,
@@ -298,95 +384,23 @@ impl PipelineSet {
     }
 }
 
-pub(super) fn strip_motion_field_shader_blocks(source: &str) -> String {
-    let mut output = String::with_capacity(source.len());
-    let mut skipping = false;
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("// MOTION_FIELD_BEGIN:") {
-            assert!(!skipping, "motion-field shader blocks must not be nested");
-            skipping = true;
-            continue;
-        }
-        if trimmed.starts_with("// MOTION_FIELD_END:") {
-            assert!(skipping, "motion-field shader block end must have a begin");
-            skipping = false;
-            continue;
-        }
-        if !skipping {
-            output.push_str(line);
-            output.push('\n');
-        }
-    }
-    assert!(!skipping, "motion-field shader block must be closed");
-    output
-}
-
-/// Dry pipelines are compiled without water varyings, cut moments, solver or depth output.
-pub(super) fn gs_shader_source(water: bool, underwater: bool) -> String {
-    assert!(water || !underwater, "underwater rendering requires water");
-    let mut body = if water {
-        include_str!("../gswt.wgsl").to_owned()
-    } else {
-        strip_tagged_shader_blocks(include_str!("../gswt.wgsl"), "WATER")
-    };
-    if !underwater {
-        body = strip_tagged_shader_blocks(&body, "UNDERWATER");
-    }
-    if water {
-        [
-            include_str!("../camera.wgsl"),
-            include_str!("../cubed_sphere.wgsl"),
-            &crate::water_hits::shader_source(3),
-            &if underwater {
-                crate::underwater::sampling_shader(3)
-            } else {
-                String::new()
-            },
-            &body,
-        ]
-        .concat()
-    } else {
-        [
-            include_str!("../camera.wgsl"),
-            include_str!("../cubed_sphere.wgsl"),
-            &body,
-            include_str!("../gswt_dry.wgsl"),
-        ]
-        .concat()
-    }
-}
-
-fn strip_tagged_shader_blocks(source: &str, tag: &str) -> String {
-    let mut body = String::new();
-    let mut skipping = false;
-    let begin = format!("// {tag}_BEGIN:");
-    let end = format!("// {tag}_END:");
-    for line in source.lines() {
-        if line.trim_start().starts_with(&begin) {
-            assert!(!skipping);
-            skipping = true;
-            continue;
-        }
-        if line.trim_start().starts_with(&end) {
-            assert!(skipping);
-            skipping = false;
-            continue;
-        }
-        if !skipping {
-            body.push_str(line);
-            body.push('\n');
-        }
-    }
-    assert!(!skipping, "{tag} shader block must be closed");
-    body
-}
-
 fn create_render_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
+    label: &str,
+    depth_compare: wgpu::CompareFunction,
+) -> wgpu::RenderPipeline {
+    create_render_pipeline_modules(device, format, layout, shader, shader, label, depth_compare)
+}
+
+pub(super) fn create_render_pipeline_modules(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    layout: &wgpu::PipelineLayout,
+    vertex_shader: &wgpu::ShaderModule,
+    fragment_shader: &wgpu::ShaderModule,
     label: &str,
     depth_compare: wgpu::CompareFunction,
 ) -> wgpu::RenderPipeline {
@@ -406,7 +420,7 @@ fn create_render_pipeline(
         label: Some(label),
         layout: Some(layout),
         vertex: wgpu::VertexState {
-            module: shader,
+            module: vertex_shader,
             entry_point: Some("vs_main"),
             buffers: &[
                 Vertex2D::desc(),
@@ -429,7 +443,7 @@ fn create_render_pipeline(
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: shader,
+            module: fragment_shader,
             entry_point: Some("fs_main"),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
